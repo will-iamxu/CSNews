@@ -1,0 +1,15 @@
+{
+  "embedColor": "#0099ff",
+  "footerText": "HLTV.org CS News Bot",
+  "maxArticlesToKeep": 20,
+  "delayBetweenMessages": 1000,
+  "commands": {
+    "checkNews": "!csnews",
+    "matches": "!csmatches",
+    "teams": "!csteams"
+  },
+  "logging": {
+    "showStartupMessage": true,
+    "showUpdateChecks": true
+  }
+}
