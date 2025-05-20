@@ -1,0 +1,33 @@
+{
+  "discord": {
+    "channelId": "your_channel_id_here",
+    "updateInterval": 15,
+    "embedColor": "#0099ff",
+    "maxNewsPerUpdate": 3,
+    "prefix": "!"
+  },
+  "scraper": {
+    "cacheTTLHours": 1,
+    "maxRequestsPerInterval": 4,
+    "requestIntervalMs": 60000,
+    "useSessionRotation": true,
+    "useProxies": false,
+    "proxyType": "standard",
+    "sessionTtl": 30,
+    "maxSessions": 5,
+    "defaultTimeout": 15000,
+    "advanced": {
+      "userAgentEnabled": true,
+      "tlsFingerprintEnabled": true,
+      "cookiesEnabled": true,
+      "dynamicDelaysEnabled": true,
+      "preferredBrowsers": ["Chrome", "Firefox"],
+      "rotateReferrers": true,
+      "evasionLevel": "medium"
+    }
+  },
+  "logging": {
+    "level": "info",
+    "showTimestamp": true
+  }
+}

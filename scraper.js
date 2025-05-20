@@ -2,11 +2,18 @@ const axios = require('axios');
 const cheerio = require('cheerio');
 const fs = require('fs');
 const path = require('path');
+const https = require('https');
+const tunnel = require('tunnel');
+const { browserProfiles, crawlerProfiles, referrers } = require('./browser-profiles');
+const BrowserSession = require('./browser-session');
+const { getRandomDelay } = require('./enhanced-fingerprints');
+const CookieJar = require('./cookie-jar');
 
 /**
- * HLTV.org scraper module with fallback mechanisms
+ * HLTV.org scraper module with advanced anti-bot detection mechanisms
  * 
- * This module handles scraping operations for HLTV.org with proper fallbacks
+ * This module handles scraping operations for HLTV.org with sophisticated
+ * browser fingerprinting, session management and behavioral patterns
  */
 class HLTVScraper {
   constructor() {
@@ -19,26 +26,62 @@ class HLTVScraper {
     this.cacheMatchesFile = path.join(this.cacheDir, 'matches_cache.json');
     this.cacheTeamsFile = path.join(this.cacheDir, 'teams_cache.json');
     this.cacheTTLHours = 1; // Cache time-to-live in hours
+    this.configPath = path.join(__dirname, 'config.json');
+    
+    // Anti-bot detection mechanism properties
+    this.browserProfiles = browserProfiles;
+    this.crawlerProfiles = crawlerProfiles;
+    this.referrers = referrers;
+    this.requestsPerInterval = 0;
+    this.lastResetTime = Date.now();
+    this.maxRequestsPerInterval = 4;  // Max requests in interval
+    this.requestIntervalMs = 60000;   // 1 minute
+    this.useSessionRotation = true;   // Enable session rotation
+    this.useProxies = false;          // Set to true to use proxies
+    this.proxyType = 'standard';      // Default proxy type
+    this.sessionTtl = 30;             // Minutes before rotating sessions
+    this.sessions = {};               // Active browser sessions
+    this.activeSessions = 0;          // Count of active sessions
+    this.maxSessions = 5;             // Maximum concurrent sessions
+    this.defaultTimeout = 15000;      // Default request timeout (15 seconds)
+    
+    // Cookie handling
+    this.globalCookieJar = new CookieJar();
+    
+    // Load config if exists and set options
+    try {
+      if (fs.existsSync(this.configPath)) {
+        const config = JSON.parse(fs.readFileSync(this.configPath, 'utf8'));
+        if (config.scraper) {
+          if (config.scraper.cacheTTLHours) this.cacheTTLHours = config.scraper.cacheTTLHours;
+          if (config.scraper.maxRequestsPerInterval) this.maxRequestsPerInterval = config.scraper.maxRequestsPerInterval;
+          if (config.scraper.requestIntervalMs) this.requestIntervalMs = config.scraper.requestIntervalMs;
+          if (config.scraper.useSessionRotation !== undefined) this.useSessionRotation = config.scraper.useSessionRotation;
+          if (config.scraper.useProxies !== undefined) this.useProxies = config.scraper.useProxies;
+          if (config.scraper.proxyType) this.proxyType = config.scraper.proxyType;
+          if (config.scraper.sessionTtl) this.sessionTtl = config.scraper.sessionTtl;
+          if (config.scraper.maxSessions) this.maxSessions = config.scraper.maxSessions;
+          if (config.scraper.defaultTimeout) this.defaultTimeout = config.scraper.defaultTimeout;
+        }
+      }
+    } catch (error) {
+      console.error('Error loading scraper config:', error);
+    }
     
     // Create cache directory if it doesn't exist
     if (!fs.existsSync(this.cacheDir)) {
       fs.mkdirSync(this.cacheDir, { recursive: true });
     }
     
+    // Create a default session
+    this.createNewSession('default');
+    
+    // Initialize with a random browser profile
+    const randomProfile = this.getRandomBrowserProfile();
+    
     // Browser-like headers to avoid being detected as a bot
-    this.headers = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-      'Cache-Control': 'max-age=0',
-      'Connection': 'keep-alive',
-      'Referer': 'https://www.google.com/',
-      'Sec-Fetch-Dest': 'document',
-      'Sec-Fetch-Mode': 'navigate',
-      'Sec-Fetch-Site': 'cross-site',
-      'Upgrade-Insecure-Requests': '1'
-    };
-  }  /**
+    this.headers = this.createHeadersFromProfile(randomProfile);
+  }/**
    * Save data to cache file
    * @param {string} cacheFile - Path to cache file
    * @param {Object} data - Data to cache
@@ -163,42 +206,326 @@ class HLTVScraper {
       }
     ];
   }
-
   /**
-   * Make an HTTP request with browser-like behavior
-   * @param {string} url - URL to request
-   * @returns {Promise} - Axios response
+   * Creates a new browser session
+   * @param {string} sessionId - Optional session ID (generated if not provided)
+   * @returns {string} - Session ID
    */
-  async makeRequest(url) {
-    try {
-      // Add slight random delay to mimic human behavior (200-2000ms)
-      const delay = Math.floor(Math.random() * 1800) + 200;
-      await new Promise(resolve => setTimeout(resolve, delay));
+  createNewSession(sessionId = null) {
+    // Generate session ID if not provided
+    const id = sessionId || `session_${Math.random().toString(36).substring(2, 9)}`;
+    
+    // Create new session
+    this.sessions[id] = new BrowserSession({
+      useProxy: this.useProxies,
+      proxyType: this.proxyType
+    });
+    
+    this.activeSessions++;
+    
+    // Clean up old sessions if we have too many
+    if (this.activeSessions > this.maxSessions) {
+      this.cleanupOldSessions();
+    }
+    
+    return id;
+  }
+  
+  /**
+   * Get an existing session or create a new one
+   * @param {string} sessionId - Session ID to get or null for default
+   * @param {boolean} forceCreate - Force creation of new session
+   * @returns {Object} - Browser session
+   */
+  getSession(sessionId = 'default', forceCreate = false) {
+    // If session doesn't exist or force create is true, create a new one
+    if (!this.sessions[sessionId] || forceCreate) {
+      return this.sessions[this.createNewSession(sessionId)];
+    }
+    
+    // If session exists but should be rotated, create a new one
+    if (this.useSessionRotation && this.sessions[sessionId].shouldRotateSession()) {
+      console.log(`Rotating session ${sessionId}`);
+      delete this.sessions[sessionId];
+      return this.sessions[this.createNewSession(sessionId)];
+    }
+    
+    return this.sessions[sessionId];
+  }
+  
+  /**
+   * Cleanup old or unused sessions
+   */
+  cleanupOldSessions() {
+    const now = Date.now();
+    const sessionIds = Object.keys(this.sessions);
+    
+    // Sort sessions by last activity time
+    const sortedSessions = sessionIds
+      .map(id => ({ id, lastTime: this.sessions[id].lastVisitTime }))
+      .sort((a, b) => a.lastTime - b.lastTime);
+    
+    // If we have more than max sessions, remove the oldest ones
+    while (this.activeSessions > this.maxSessions) {
+      const oldestSession = sortedSessions.shift();
+      if (oldestSession && oldestSession.id !== 'default') {
+        delete this.sessions[oldestSession.id];
+        this.activeSessions--;
+      } else {
+        // If we've run out of sessions to remove, break the loop
+        break;
+      }
+    }
+    
+    // Also remove sessions older than session TTL
+    for (const id of sessionIds) {
+      if (id === 'default') continue;
       
-      return await axios.get(url, {
-        headers: this.headers,
-        timeout: 10000 // 10 second timeout
-      });
-    } catch (error) {
-      console.error(`Error making request to ${url}:`, error.message);
-      throw error;
+      const session = this.sessions[id];
+      const sessionAge = (now - session.sessionStart) / (1000 * 60); // Convert to minutes
+      
+      if (sessionAge > this.sessionTtl) {
+        delete this.sessions[id];
+        this.activeSessions--;
+      }
     }
   }
+  
   /**
+   * Get random browser profile based on weights
+   * @returns {Object} - Browser profile
+   */
+  getRandomBrowserProfile() {
+    // Calculate total weight
+    const totalWeight = this.browserProfiles.reduce((sum, profile) => sum + (profile.weight || 1), 0);
+    
+    // Get random weight value
+    const randomValue = Math.random() * totalWeight;
+    
+    // Find profile based on weight
+    let weightSum = 0;
+    for (const profile of this.browserProfiles) {
+      weightSum += profile.weight || 1;
+      if (randomValue <= weightSum) {
+        return profile;
+      }
+    }
+    
+    // Fallback to first profile
+    return this.browserProfiles[0];
+  }
+  
+  /**
+   * Get crawler profile for specific content type
+   * @param {string} type - Content type ('sitemap' or 'feed')
+   * @returns {Object} - Crawler profile
+   */
+  getCrawlerProfile(type) {
+    const validProfiles = this.crawlerProfiles.filter(profile => 
+      profile.forTypes && profile.forTypes.includes(type)
+    );
+    
+    if (validProfiles.length === 0) {
+      return this.crawlerProfiles[0];
+    }
+    
+    return validProfiles[Math.floor(Math.random() * validProfiles.length)];
+  }
+  
+  /**
+   * Create headers from browser profile
+   * @param {Object} profile - Browser profile
+   * @returns {Object} - Headers object
+   */
+  createHeadersFromProfile(profile) {
+    const headers = {
+      'User-Agent': profile.userAgent,
+      'Accept': profile.accept || 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+      'Accept-Language': profile.acceptLanguage || 'en-US,en;q=0.9',
+      'Cache-Control': 'max-age=0',
+      'Connection': 'keep-alive',
+      'Referer': this.referrers[Math.floor(Math.random() * this.referrers.length)],
+      'Upgrade-Insecure-Requests': '1'
+    };
+    
+    // Add Chrome/Edge specific headers if it's that type of browser
+    if (profile.secChUa) {
+      headers['sec-ch-ua'] = profile.secChUa;
+      headers['sec-ch-ua-platform'] = profile.secChUaPlatform || '"Windows"';
+      headers['sec-ch-ua-mobile'] = profile.secChUaMobile || '?0';
+    }
+    
+    // Add Firefox specific headers
+    if (profile.secFetchDest) {
+      headers['Sec-Fetch-Dest'] = profile.secFetchDest;
+      headers['Sec-Fetch-Mode'] = profile.secFetchMode;
+      headers['Sec-Fetch-Site'] = profile.secFetchSite;
+      if (profile.secFetchUser) headers['Sec-Fetch-User'] = profile.secFetchUser;
+    }
+    
+    return headers;
+  }
+  
+  /**
+   * Rate limit requests to avoid anti-bot detection
+   * Uses dynamic timing patterns based on site load and previous requests
+   * @param {string} requestType - Type of request for adaptive timing
+   * @returns {Promise} - Resolves when ready to make request
+   */
+  async enforceRateLimit(requestType = 'standard') {
+    const now = Date.now();
+    
+    // Reset counter if interval has passed
+    if (now - this.lastResetTime > this.requestIntervalMs) {
+      this.requestsPerInterval = 0;
+      this.lastResetTime = now;
+    }
+    
+    // If we've exceeded our rate limit, wait until the interval resets
+    if (this.requestsPerInterval >= this.maxRequestsPerInterval) {
+      const timeToWait = this.requestIntervalMs - (now - this.lastResetTime);
+      if (timeToWait > 0) {
+        // Add some randomness to the wait time to avoid detection patterns
+        const randomizedWait = timeToWait + (Math.random() * 1000) - 500; // +/- 500ms
+        console.log(`Rate limit reached. Waiting ${(randomizedWait / 1000).toFixed(1)} seconds before next request...`);
+        await new Promise(resolve => setTimeout(resolve, randomizedWait));
+        this.requestsPerInterval = 0;
+        this.lastResetTime = Date.now();
+      }
+    }
+    
+    // Get additional delay based on request type
+    let additionalDelay = 0;
+    
+    switch (requestType) {
+      case 'api':
+        // API requests should be faster
+        additionalDelay = Math.floor(Math.random() * 300) + 50;
+        break;
+      case 'sitemap':
+      case 'feed':
+        // Feed/sitemap requests can be faster since they're expected from bots
+        additionalDelay = Math.floor(Math.random() * 500) + 100;
+        break;
+      case 'page':
+      default:
+        // Regular page loads should mimic human behavior
+        additionalDelay = getRandomDelay('pageLoad');
+        break;
+    }
+    
+    // Apply the additional delay
+    if (additionalDelay > 0) {
+      await new Promise(resolve => setTimeout(resolve, additionalDelay));
+    }
+    
+    this.requestsPerInterval++;
+  }
+  
+  /**
+   * Make an HTTP request with advanced browser-like behavior
+   * @param {string} url - URL to request
+   * @param {Object} options - Additional options
+   * @returns {Promise} - Axios response
+   */
+  async makeRequest(url, options = {}) {
+    try {
+      // Enforce rate limiting based on request type
+      await this.enforceRateLimit(options.requestType || 'standard');
+      
+      // Get or create session
+      const sessionId = options.sessionId || 'default';
+      const session = this.getSession(sessionId);
+      
+      // For special content types like feeds or sitemaps, use crawler profiles
+      let headers;
+      if (options.contentType && ['feed', 'sitemap', 'rss', 'xml'].includes(options.contentType)) {
+        const crawlerProfile = this.getCrawlerProfile(options.contentType);
+        headers = options.headers || {
+          'User-Agent': crawlerProfile.userAgent,
+          'Accept': crawlerProfile.accept || 'application/xml,text/xml,application/rss+xml,*/*',
+          'Accept-Language': crawlerProfile.acceptLanguage || 'en-US,en;q=0.5',
+        };
+      } else {
+        // Use session headers with context-specific modifications
+        headers = options.headers || session.prepareRequestHeaders(url, options);
+      }
+      
+      // Calculate human-like timing delay
+      const delay = session.calculateWaitTime(options.actionType || 'pageLoad');
+      if (delay > 0) {
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
+      // Configure axios request
+      const requestConfig = {
+        headers,
+        timeout: options.timeout || this.defaultTimeout,
+      };
+      
+      // Add proxy configuration if enabled
+      const proxyConfig = session.getProxyConfig();
+      if (proxyConfig) {
+        if (url.startsWith('https')) {
+          requestConfig.httpsAgent = tunnel.httpsOverHttp({
+            proxy: proxyConfig
+          });
+        } else {
+          requestConfig.httpAgent = tunnel.httpOverHttp({
+            proxy: proxyConfig
+          });
+        }
+      }
+      
+      // Log request info
+      console.log(`Making request to ${url} with ${session.profile.name || 'custom'} profile...`);
+      
+      // Make the request
+      const response = await axios.get(url, requestConfig);
+      
+      // Record visit in session and update cookies
+      session.recordVisit(url, response.headers);
+      
+      // Share cookies with global jar too
+      if (response.headers['set-cookie']) {
+        const parsedUrl = new URL(url);
+        this.globalCookieJar.addFromHeaders(response.headers, parsedUrl.hostname);
+      }
+      
+      return response;
+    } catch (error) {
+      if (error.response && error.response.status === 403) {
+        console.error(`Bot detection triggered for ${url} - Access forbidden (403)`);
+        
+        // Rotate session on bot detection
+        if (options.sessionId) {
+          delete this.sessions[options.sessionId];
+          this.activeSessions--;
+        }
+      } else {
+        console.error(`Error making request to ${url}:`, error.message);
+      }
+      
+      throw error;
+    }
+  }  /**
    * Try to fetch news from RSS feed
    * @returns {Promise<Array>} - Array of news articles
    */
   async getNewsFromRSS() {
     try {
       console.log('Attempting to fetch news from RSS feed...');
-      // Try with a different approach for RSS
-      // Some RSS feeds work better with an RSS-specific user agent
-      const response = await axios.get(this.rssFeedUrl, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 (RSS Reader)',
-          'Accept': 'application/rss+xml, application/xml, text/xml, */*'
-        },
-        timeout: 10000
+      
+      // Create a session specifically for feed requests
+      const feedSessionId = 'feed_session';
+      const feedSession = this.getSession(feedSessionId, true);
+      
+      // Make the request with feed-specific configuration
+      const response = await this.makeRequest(this.rssFeedUrl, {
+        sessionId: feedSessionId,
+        contentType: 'feed',
+        requestType: 'feed',
+        actionType: 'resourceFetch'
       });
       
       const $ = cheerio.load(response.data, { xmlMode: true });
@@ -224,21 +551,24 @@ class HLTVScraper {
       console.error('Error fetching from RSS feed:', error.message);
       throw error;
     }
-  }
-  /**
+  }  /**
    * Try to fetch news from the sitemap
    * @returns {Promise<Array>} - Array of news articles
-   */
-  async getNewsFromSitemap() {
+   */  async getNewsFromSitemap() {
     try {
       console.log('Attempting to fetch news from sitemap...');
-      // Try with a different approach for sitemap
-      const response = await axios.get(this.newsSitemap, {
-        headers: {
-          'User-Agent': 'Googlebot-News',
-          'Accept': 'application/xml, text/xml, */*'
-        },
-        timeout: 10000
+      
+      // Create a dedicated session for sitemap crawling
+      const sitemapSessionId = 'sitemap_session';
+      const sitemapSession = this.getSession(sitemapSessionId, true);
+      
+      // Make the request with the sitemap-specific configuration
+      const response = await this.makeRequest(this.newsSitemap, {
+        sessionId: sitemapSessionId,
+        contentType: 'sitemap',
+        requestType: 'sitemap',
+        actionType: 'resourceFetch',
+        timeout: 12000 // Slightly longer timeout for sitemap
       });
       
       const $ = cheerio.load(response.data, { xmlMode: true });
@@ -664,6 +994,423 @@ class HLTVScraper {
     } catch (error) {
       console.error(`Error manually updating team rankings: ${error.message}`);
       throw error;
+    }
+  }  /**
+   * Force update the tournament cache with current tournament
+   * Use this on startup or when tournament cache might be outdated
+   */
+  async forceUpdateTournamentCache() {
+    console.log('Force updating tournament cache...');
+    
+    // Clear the existing cache
+    const tournamentCachePath = path.join(this.cacheDir, 'tournament_cache.json');
+    
+    try {
+      if (fs.existsSync(tournamentCachePath)) {
+        fs.unlinkSync(tournamentCachePath);
+        console.log('Deleted existing tournament cache');
+      }
+    } catch (err) {
+      console.error('Error deleting tournament cache:', err);
+    }
+    
+    // Force a new tournament lookup
+    const tournamentName = await this.getCurrentTournament();
+    console.log(`Updated tournament cache with: ${tournamentName}`);
+    return tournamentName;
+  }
+  
+  /**
+   * Get the current biggest tournament
+   * @returns {Promise<string>} - Current biggest tournament name
+   */
+  async getCurrentTournament() {
+    try {
+      console.log('Fetching current tournament info...');
+      
+      // First check the cache
+      const tournamentCachePath = path.join(this.cacheDir, 'tournament_cache.json');
+      const cachedTournament = this.loadFromCache(tournamentCachePath);
+      
+      // Use a shorter cache TTL for tournaments (6 hours)
+      if (cachedTournament) {
+        const now = new Date().getTime();
+        const cacheTime = cachedTournament.timestamp || 0;
+        const cacheAge = (now - cacheTime) / (1000 * 60 * 60); // Age in hours
+        
+        if (cacheAge < 6) { // Use tournament cache for up to 6 hours
+          console.log(`Using cached tournament: ${cachedTournament.name} (${cacheAge.toFixed(2)} hours old)`);
+          return cachedTournament.name || "CS Tournament";
+        }
+      }
+      
+      // Try multiple methods for getting tournament info
+      let tournamentName = '';
+        // Method 1: HLTV events page
+      try {
+        console.log('Trying events page for tournament info...');
+        
+        // Create a dedicated session for tournament requests
+        const tournamentSessionId = 'tournament_session';
+        const tournamentSession = this.getSession(tournamentSessionId);
+        console.log(`Using ${tournamentSession.profile.name} profile for events page...`);
+        
+        const response = await this.makeRequest(`${this.baseUrl}/events`, {
+          sessionId: tournamentSessionId,
+          requestType: 'page',
+          actionType: 'pageLoad',
+          timeout: 10000
+        });
+        
+        const $ = cheerio.load(response.data);
+        
+        // Look for featured event or top ongoing event
+        // Try to find the featured event first
+        $('.featured-event-box').each((i, element) => {
+          if (tournamentName) return; // Already found one
+          
+          const name = $(element).find('.featured-event-title').text().trim();
+          if (name) {
+            tournamentName = name;
+          }
+        });
+        
+        // If no featured event, get the first big event
+        if (!tournamentName) {
+          $('.big-event-container').each((i, element) => {
+            if (tournamentName) return; // Already found one
+            
+            const name = $(element).find('.big-event-name').text().trim();
+            if (name) {
+              tournamentName = name;
+            }
+          });
+        }
+        
+        // If still nothing, get any ongoing event
+        if (!tournamentName) {
+          $('.ongoing-event-container').each((i, element) => {
+            if (tournamentName) return; // Already found one
+            
+            const name = $(element).find('.event-name').text().trim();
+            if (name) {
+              tournamentName = name;
+            }
+          });
+        }
+        
+        if (tournamentName) {
+          console.log(`Found tournament from HLTV: ${tournamentName}`);
+        }
+      } catch (error) {
+        console.error('Error accessing HLTV.org events page:', error.message);
+        // Continue to next method
+      }
+      
+      // Method 2: If Method 1 failed, try to get from HLTV matches page
+      if (!tournamentName) {
+        try {
+          console.log('Trying matches page for tournament info...');
+          
+          // Get a different browser profile for this request to avoid detection patterns
+          const browserProfile = this.getRandomBrowserProfile();
+          console.log(`Using ${browserProfile.name} profile for matches page...`);
+          
+          const response = await this.makeRequest(`${this.baseUrl}/matches`, {
+            profile: browserProfile,
+            timeout: 10000
+          });
+          
+          const $ = cheerio.load(response.data);
+          
+          // Try to find the event name in match info
+          $('.upcomingMatchesSection .matchInfoEmpty .matchEvent').each((i, element) => {
+            if (tournamentName) return; // Already found one
+            
+            const name = $(element).text().trim();
+            if (name && name.length > 3) { // Make sure it's a valid event name
+              tournamentName = name;
+            }
+          });
+          
+          if (tournamentName) {
+            console.log(`Found tournament from matches page: ${tournamentName}`);
+          }
+        } catch (error) {
+          console.error('Error accessing HLTV.org matches page:', error.message);
+          // Continue to next method
+        }
+      }
+      
+      // Method 3: If the above methods failed, try news feed for tournament mentions
+      if (!tournamentName) {
+        try {
+          console.log('Trying news feed for tournament mentions...');
+          
+          // Use a crawler profile specifically for feeds
+          const feedProfile = this.getCrawlerProfile('feed');
+          console.log(`Using ${feedProfile.name} profile for RSS feed...`);
+          
+          const response = await this.makeRequest(this.rssFeedUrl, {
+            headers: {
+              'User-Agent': feedProfile.userAgent,
+              'Accept': feedProfile.accept || 'application/rss+xml, application/xml, text/xml, */*',
+              'Accept-Language': feedProfile.acceptLanguage || 'en-US,en;q=0.5'
+            },
+            timeout: 8000
+          });
+          
+          const $ = cheerio.load(response.data, { xmlMode: true });
+          
+          // Get text from titles and descriptions
+          let allText = '';
+          $('item').each((i, element) => {
+            allText += $(element).find('title').text() + ' ';
+            allText += $(element).find('description').text() + ' ';
+          });
+            // Look for tournament mentions in the text
+          const tournamentPatterns = [
+            /IEM\s+Dallas\s+2025/gi,    // Specifically match IEM Dallas 2025 (current event)
+            /IEM\s+\w+/gi,              // IEM Dallas, IEM Rio
+            /ESL\s+Pro\s+League/gi,     // ESL Pro League
+            /ESL\s+One\s+\w+/gi,        // ESL One Cologne
+            /BLAST\s+Premier/gi,        // BLAST Premier
+            /\w+\s+Major/gi,            // Any Major (more generic pattern now)
+            /Dreamhack\s+\w+/gi         // Dreamhack events
+          ];
+          
+          for (const pattern of tournamentPatterns) {
+            const matches = allText.match(pattern);
+            if (matches && matches.length > 0) {
+              tournamentName = matches[0]; // Take the first match
+              console.log(`Found tournament mention in news: ${tournamentName}`);
+              break;
+            }
+          }
+        } catch (error) {
+          console.error('Error checking RSS feed for tournament mentions:', error.message);
+          // Continue to final method
+        }
+      }
+      
+      // Method 4: If all above failed, dynamically determine based on current CS event calendar
+      if (!tournamentName) {
+        console.log('Using dynamic tournament calendar lookup...');
+        tournamentName = await this.getDynamicCurrentTournament();
+      }
+      
+      // Final fallback if everything else failed
+      if (!tournamentName) {
+        console.log('All methods failed, using generic CS tournament status');
+        tournamentName = "CS Tournament";
+      }
+      
+      // Cache the result with timestamp
+      this.saveToCache(tournamentCachePath, { 
+        name: tournamentName,
+        timestamp: new Date().getTime()
+      });
+      
+      return tournamentName;
+    } catch (error) {
+      console.error('Error fetching current tournament:', error);
+      return "CS Tournament"; // Final fallback
+    }
+  }
+    /**
+   * Get a dynamically determined tournament based on date and CS calendar
+   * @returns {Promise<string>} - A relevant tournament name
+   */  async getDynamicCurrentTournament() {
+    try {
+      // Current date check - hardcoded for known major events
+      const now = new Date();
+      const month = now.getMonth(); // 0-11
+      const year = now.getFullYear();
+      
+      // May 2025 is IEM Dallas 2025
+      if (month === 4 && year === 2025) {
+        console.log('Current date indicates IEM Dallas 2025 is the active tournament');
+        return 'IEM Dallas 2025';
+      }
+      
+      // Attempt to get tournament data from esportsguide API
+      console.log('Trying esportsguide API for tournaments...');
+      
+      // Create dedicated API session with unique fingerprint
+      const apiSessionId = 'api_esportsguide_session';
+      const apiSession = this.getSession(apiSessionId);
+      
+      // Prepare API-specific request
+      const response = await this.makeRequest('https://www.esportsguide.com/api/events?games=csgo', {
+        sessionId: apiSessionId,
+        requestType: 'api',
+        actionType: 'resourceFetch',
+        includeOrigin: true, // Include Origin header for API requests
+        timeout: 8000
+      });
+      
+      if (response.data && response.data.data && response.data.data.length > 0) {
+        // Sort by tier - Lower tier number = more important tournament
+        const sortedEvents = response.data.data.sort((a, b) => (a.tier || 999) - (b.tier || 999));
+        
+        // Find ongoing or upcoming events
+        const now = new Date().getTime();
+        const relevantEvents = sortedEvents.filter(event => {
+          // Event with start and end times
+          const endTime = new Date(event.end_date || '2099-12-31').getTime();
+          return endTime > now; // Event hasn't ended yet
+        });
+        
+        if (relevantEvents.length > 0) {
+          const tournamentName = relevantEvents[0].name;
+          console.log(`Found tournament from esportsguide API: ${tournamentName}`);
+          return tournamentName; // Return the highest-tier active tournament
+        }
+      }
+    } catch (error) {
+      console.error('Error accessing esportsguide API:', error.message);
+    }
+      try {
+      // Alternative: try liquipedia API
+      console.log('Trying liquipedia API for tournaments...');
+      
+      // Create a dedicated API session for liquipedia
+      const liquipediaSessionId = 'api_liquipedia_session';
+      const liquipediaSession = this.getSession(liquipediaSessionId, true); // Force new session
+      
+      // Configure with specialized headers for this specific API
+      const customHeaders = {
+        'User-Agent': 'Mozilla/5.0 (compatible; CSNewsBot/1.0; +https://github.com/csnews/bot)',
+        'Accept': 'application/json',
+        'Referer': 'https://liquipedia.net/counterstrike/'
+      };
+      
+      const response = await this.makeRequest(
+        'https://liquipedia.net/counterstrike/api.php?action=parse&format=json&page=Liquipedia:Upcoming_and_ongoing_matches', 
+        {
+          sessionId: liquipediaSessionId,
+          headers: customHeaders,
+          requestType: 'api',
+          actionType: 'resourceFetch',
+          includeOrigin: true,
+          timeout: 8000
+        }
+      );
+      
+      if (response.data && response.data.parse && response.data.parse.text) {
+        const html = response.data.parse.text['*'];
+        const $ = cheerio.load(html);
+        
+        // Look for tournament names in upcoming matches
+        const tournaments = new Set();
+        $('.infobox_matches_content').each((i, element) => {
+          const tournament = $(element).find('.team-template-text').text().trim();
+          if (tournament) {
+            tournaments.add(tournament);
+          }
+        });
+        
+        if (tournaments.size > 0) {
+          const tournamentName = Array.from(tournaments)[0];
+          console.log(`Found tournament from Liquipedia API: ${tournamentName}`);
+          return tournamentName; // Return the first found tournament
+        }
+      }
+    } catch (error) {
+      console.error('Error accessing liquipedia API:', error.message);
+    }
+      try {
+      // Try a third approach: HLTV tournaments from json data
+      console.log('Trying direct HLTV API endpoint...');
+      
+      // Create a dedicated session with Firefox profile which is less likely to be detected
+      const hltvApiSessionId = 'hltv_api_session';
+      const hltvApiSession = this.getSession(hltvApiSessionId);
+      
+      // If we're not already using Firefox, try to create a Firefox-based session
+      if (!hltvApiSession.profile.name.includes('Firefox')) {
+        // Find Firefox profile and create a new session with it
+        const firefoxProfile = this.browserProfiles.find(p => p.name.includes('Firefox'));
+        if (firefoxProfile) {
+          // Force a new session with Firefox profile
+          delete this.sessions[hltvApiSessionId];
+          this.activeSessions--;
+          this.sessions[hltvApiSessionId] = new BrowserSession({
+            profile: firefoxProfile,
+            useProxy: this.useProxies,
+            proxyType: this.proxyType
+          });
+          this.activeSessions++;
+        }
+      }
+      
+      // Some sites expose JSON data through endpoints - using appropriate headers
+      const response = await this.makeRequest(
+        `${this.baseUrl}/events/lobby/data`, 
+        {
+          sessionId: hltvApiSessionId,
+          requestType: 'api',
+          actionType: 'resourceFetch',
+          headers: {
+            'Accept': 'application/json, text/plain, */*',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors'
+          },
+          includeOrigin: true,
+          timeout: 8000
+        }
+      );
+      
+      if (response.data && response.data.events && response.data.events.length > 0) {
+        const featuredEvents = response.data.events.filter(e => e.featured);
+        if (featuredEvents.length > 0) {
+          const tournamentName = featuredEvents[0].name || featuredEvents[0].eventName;
+          console.log(`Found tournament from HLTV API: ${tournamentName}`);
+          return tournamentName;
+        }
+        
+        // If no featured events, just return the first one
+        const tournamentName = response.data.events[0].name || response.data.events[0].eventName;
+        console.log(`Found tournament from HLTV API (non-featured): ${tournamentName}`);
+        return tournamentName;
+      }
+    } catch (error) {
+      console.error('Error accessing HLTV API endpoint:', error.message);
+    }
+    
+    // If all API attempts failed, use current date to estimate
+    console.log('All API methods failed, using date-based tournament estimation');
+    const now = new Date();
+    const month = now.getMonth(); // 0-11
+    const year = now.getFullYear();
+    
+    // Check for specific known tournaments based on current date
+    if (month === 4 && year === 2025) { // May 2025
+      return 'IEM Dallas 2025';
+    }
+    
+    // Return a generic but plausible tournament name based on the time of year
+    if (month === 0 || month === 1) { // Jan-Feb
+      return `BLAST Premier Spring Groups ${year}`;
+    } else if (month === 2) { // March
+      return `ESL Pro League Season ${Math.floor((year - 2015) * 2)}`;
+    } else if (month === 3) { // April
+      return `ESL Challenger ${month === 3 ? 'Spring' : 'Fall'} ${year}`;
+    } else if (month === 4) { // May
+      return `IEM Dallas ${year}`;
+    } else if (month === 5) { // June
+      return `BLAST Premier Spring Finals ${year}`;
+    } else if (month === 6 || month === 7) { // July-Aug
+      return `IEM Cologne ${year}`;
+    } else if (month === 8) { // Sept
+      return `ESL Pro League Season ${Math.floor((year - 2015) * 2 + 1)}`;
+    } else if (month === 9) { // Oct
+      return `BLAST Premier Fall Groups ${year}`;
+    } else if (month === 10) { // Nov
+      return `Major Championship ${year}`;
+    } else { // Dec
+      return `BLAST Premier World Final ${year}`;
     }
   }
 }

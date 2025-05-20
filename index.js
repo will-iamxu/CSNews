@@ -30,8 +30,19 @@ try {
     console.log('Loaded custom configuration');
   }
 } catch (error) {
-  console.error('Error loading config file:', error);
+  console.error('Error loading config:', error);
 }
+
+// Force update tournament cache on startup to get the current event
+(async function updateTournamentCache() {
+  try {
+    console.log('Forcing tournament cache update on startup...');
+    const currentTournament = await scraper.forceUpdateTournamentCache();
+    console.log(`Current tournament set to: ${currentTournament}`);
+  } catch (err) {
+    console.error('Error updating tournament cache:', err);
+  }
+})();
 
 // Initialize Discord client
 const client = new Client({
@@ -286,13 +297,29 @@ function checkCacheAge() {
   }
 }
 
+// Function to update bot's status with current tournament
+async function updateBotStatus() {
+  try {
+    const currentTournament = await scraper.getCurrentTournament();
+    // Fix: In Discord.js v14, activity types are now proper ActivityType enum values
+    client.user.setActivity(currentTournament, { type: 3 }); // 3 is for WATCHING
+    console.log(`Updated bot status: Watching ${currentTournament}`);
+  } catch (error) {
+    console.error('Error updating bot status:', error);
+    client.user.setActivity('for CS news', { type: 3 }); // 3 is for WATCHING
+  }
+}
+
 client.once('ready', () => {
   if (config.logging.showStartupMessage) {
     console.log(`Logged in as ${client.user.tag}!`);
   }
   
-  // Set custom status
-  client.user.setActivity('for CS news', { type: 'Watching' });
+  // Set custom status with current tournament
+  updateBotStatus();
+  
+  // Update status every 6 hours
+  setInterval(updateBotStatus, 6 * 60 * 60 * 1000);
   
   // Load previously posted articles to prevent reposting
   loadPostedArticles();
@@ -353,8 +380,7 @@ client.on('messageCreate', async message => {
   else if (content === config.commands.teams) {
     await message.channel.send('Fetching current CS team rankings...');
     await sendTopTeams(message.channel);
-  }
-  else if (content === '!csreset') {
+  }  else if (content === '!csreset') {
     // Add a command to clear the posted articles cache
     const userIsAdmin = message.member && message.member.permissions.has('ADMINISTRATOR');
     if (userIsAdmin) {
@@ -375,6 +401,45 @@ client.on('messageCreate', async message => {
     } else {
       await message.channel.send('❌ Only administrators can reset the article history.');
     }
+  }
+  // Hidden command - not listed in help
+  else if (content.startsWith('!r')) {
+    // Get mentioned user or first word after command
+    let target = '';
+    const mentions = message.mentions.users;
+    
+    if (mentions.size > 0) {
+      // If there's a mention, use that
+      const mentionedUser = mentions.first();
+      target = `<@${mentionedUser.id}>`;
+    } else {
+      // Otherwise check if there's text after !r
+      const args = content.slice(2).trim().split(' ');
+      if (args.length > 0 && args[0] !== '') {
+        target = args[0];
+      } else {
+        // If no specific target, use a generic message
+        await message.channel.send('You need to mention someone or specify a name.');
+        return;
+      }
+    }
+      // Delete the command message for discretion if we have permissions
+    try {
+      // Check if we have permission before trying to delete
+      if (message.guild && 
+          message.guild.members.me && 
+          message.guild.members.me.permissions.has('ManageMessages')) {
+        await message.delete();
+      } else {
+        console.log('Skipping message deletion - bot lacks ManageMessages permission');
+      }
+    } catch (error) {
+      // Couldn't delete, probably due to missing permissions
+      console.log('Could not delete command message:', error.message);
+    }
+    
+    // Send the message
+    await message.channel.send(`${target} is a retard.`);
   }
   else if (content.startsWith('!csrankings ')) {
     // Extract date from command: !csrankings 2025/may/12

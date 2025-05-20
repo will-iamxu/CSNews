@@ -8,6 +8,7 @@ A Discord bot that scrapes the latest Counter-Strike news, matches, and team ran
 - Posts new articles to a specified Discord channel
 - Shows upcoming matches with `!csmatches`
 - Displays current team rankings with `!csteams`
+- Advanced anti-bot detection system ([see ANTIBOT.md](ANTIBOT.md))
 - Avoids duplicate posts
 - Configurable update interval
 - Enhanced error handling and auto-restart capabilities
@@ -44,25 +45,35 @@ A Discord bot that scrapes the latest Counter-Strike news, matches, and team ran
 
 ## Customization
 
-You can customize the bot by editing the `config.json` file:
+You can customize the bot by creating a `config.json` file (use `config.json.sample` as a template):
 
 ```json
 {
-  "embedColor": "#0099ff",
-  "footerText": "HLTV.org CS News Bot",
-  "maxArticlesToKeep": 20,
-  "delayBetweenMessages": 1000,
-  "commands": {
-    "checkNews": "!csnews",
-    "matches": "!csmatches",
-    "teams": "!csteams"
+  "discord": {
+    "channelId": "your_channel_id_here",
+    "updateInterval": 15,
+    "embedColor": "#0099ff",
+    "maxNewsPerUpdate": 3,
+    "prefix": "!"
+  },
+  "scraper": {
+    "cacheTTLHours": 1,
+    "maxRequestsPerInterval": 4,
+    "requestIntervalMs": 60000,
+    "useSessionRotation": true,
+    "useProxies": false,
+    "defaultTimeout": 15000
   },
   "logging": {
-    "showStartupMessage": true,
-    "showUpdateChecks": true
+    "level": "info",
+    "showTimestamp": true
   }
 }
 ```
+
+See [CONFIG.md](CONFIG.md) for detailed explanation of all configuration options.
+
+The anti-bot detection system can be fine-tuned through these settings to balance between access reliability and avoiding detection. See [ANTIBOT.md](ANTIBOT.md) for more information on how the anti-bot system works.
 
 ## Getting Your Discord Bot Token
 
@@ -116,21 +127,28 @@ If you see "DiscordAPIError[50001]: Missing Access", it means the bot doesn't ha
 
 ### HLTV Access Issues
 
-HLTV.org uses anti-bot measures that can block scrapers. If you see "Request failed with status code 403", the bot is being blocked by HLTV's protection. Our bot is designed to handle this with:
+HLTV.org uses anti-bot measures that can block scrapers. If you see "Request failed with status code 403", the bot is being blocked by HLTV's protection. Our bot now includes advanced anti-bot detection mechanisms:
 
-1. Multiple scraping methods (website, RSS feed, sitemap)
-2. Local caching (data is cached for 1 hour by default)
-3. Fallback content when all methods fail
+1. Advanced browser fingerprinting system that mimics real browsers
+2. Multiple scraping methods (website, RSS feed, sitemap)
+3. Session management with cookie support and rotation
+4. Rate limiting with human-like request patterns
+5. Multiple fallback methods when access is restricted
+6. Local caching (configurable cache time)
 
-You can test the scraper separately:
+You can test the scraper and anti-bot system separately:
 ```
-npm run test:scraper
+npm run test:scraper   # Test basic scraper functionality
+npm run test:antibot   # Test anti-bot detection system
 ```
 
-If you continue to have issues, you might want to:
-- Increase the cache TTL in `scraper.js` (change `cacheTTLHours` to a higher value)
+For detailed configuration of the anti-bot system, see [CONFIG.md](CONFIG.md) and [ANTIBOT.md](ANTIBOT.md).
+
+If you continue to have issues:
+- Adjust the anti-bot settings in your `config.json` file
+- Enable proxy support (requires setting up proxies in `enhanced-fingerprints.js`)
+- Increase the cache TTL in your config (change `cacheTTLHours` to a higher value)
 - Run the bot on a server with a different IP address
-- Consider implementing a solution with a legitimate browser automation like Puppeteer
 
 ### Message Content Intent Issues
 
