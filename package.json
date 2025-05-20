@@ -6,7 +6,9 @@
   "scripts": {
     "start": "node index.js",
     "start:wrapper": "node start.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:channel": "node test-channel.js",
+    "test:scraper": "node test-scraper.js"
   },
   "keywords": [],
   "author": "",
